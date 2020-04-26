@@ -151,7 +151,7 @@ class L2Forwarder:
     self._local_mac_address = None
 
   def sniff_and_forward(self, packet):
-    if not self._local_mac_address:
+    if not self._local_mac_address and packet.dst == 'ff:ff:ff:ff:ff:ff':
       if (not self._rebroadcaster.is_spoofed_address(packet.src) and
           packet.src[:OUI_PREFIX_LENGTH] in XBOX_OUI_PREFIXES):
         log.info("Discovered XBox on local network with MAC %s!", packet.src)
@@ -161,7 +161,7 @@ class L2Forwarder:
       log.debug("Got packet needing forward: %r!", packet)
       self._loop.call_soon_threadsafe(self._tunnel.add_to_tunnel_queue, bytes(packet))
     else:
-      log.debug("Ignoring broadcast packet from %s", packet.src)
+      log.debug("Ignoring packet from %s", packet.src)
 
 
 def main(peer_address, listen_interface, capture_filter):
@@ -240,6 +240,6 @@ uvloop.install()
 main(
     peer_address=(args.peer_host, args.listen_port),
     listen_interface=args.interface,
-    capture_filter=args.filter or 'ether dst ff:ff:ff:ff:ff:ff',
+    capture_filter=args.filter or 'udp port 3074',
 )
 
