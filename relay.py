@@ -1,14 +1,11 @@
 import asyncio
-import argparse
 import logging
 import queue
-import sys
 import threading
 
 from scapy.layers import inet, l2
 import scapy.packet
 import scapy.sendrecv
-import uvloop
 
 
 MAC_LENGTH = 17
@@ -187,54 +184,60 @@ def main(local_address, peer_addresses, listen_interface, capture_filter):
   rebroadcaster.join()
 
 
-parser = argparse.ArgumentParser(description='Relay XBox packets.')
-parser.add_argument('-i', '--interface',
-                    required=True,
-                    help="BSD interface name on which to handle XBox packets")
+if __name__ == "__main__":
+  import argparse
+  import sys
 
-parser.add_argument('-p', '--peer-host',
-                    action='append',
-                    help="Peer host to which to forward packets.")
+  import uvloop
 
-parser.add_argument('-l', '--listen-port',
-                    type=int,
-                    default=6715,
-                    help="Port for listen server")
-parser.add_argument("-v", "--verbose",
-                    action='count',
-                    help="Verbosity level (can be specified multiple times")
+  parser = argparse.ArgumentParser(description='Relay XBox packets.')
+  parser.add_argument('-i', '--interface',
+                      required=True,
+                      help="BSD interface name on which to handle XBox packets")
 
-parser.add_argument('-F', '--filter',
-                    default=None,
-                    help="Custom BPF filter")
+  parser.add_argument('-p', '--peer-host',
+                      action='append',
+                      help="Peer host to which to forward packets.")
 
+  parser.add_argument('-l', '--listen-port',
+                      type=int,
+                      default=6715,
+                      help="Port for listen server")
+  parser.add_argument("-v", "--verbose",
+                      action='count',
+                      help="Verbosity level (can be specified multiple times")
 
-args = parser.parse_args()
-log_level = logging.WARNING
-for verbosity in range(args.verbose or 0):
-  if log_level > logging.DEBUG:
-    log_level -= (logging.ERROR - logging.WARNING)
-
-logging.basicConfig(level=log_level)
+  parser.add_argument('-F', '--filter',
+                      default=None,
+                      help="Custom BPF filter")
 
 
-peer_addresses = []
-if not args.peer_host:
-  log.error("Must specify at least one peer!")
-  sys.exit(1)
-for peer_host in args.peer_host:
-  port = args.listen_port
-  host, *maybe_port = peer_host.split(":", 1)
-  if maybe_port:
-    port = int(maybe_port[0])
-  peer_addresses.append((host, port))
+  args = parser.parse_args()
+  log_level = logging.WARNING
+  for verbosity in range(args.verbose or 0):
+    if log_level > logging.DEBUG:
+      log_level -= (logging.ERROR - logging.WARNING)
+
+  logging.basicConfig(level=log_level)
 
 
-uvloop.install()
-main(
-    local_address=("0.0.0.0", args.listen_port),
-    peer_addresses=peer_addresses,
-    listen_interface=args.interface,
-    capture_filter=args.filter or 'udp port 3074',
-)
+  peer_addresses = []
+  if not args.peer_host:
+    log.error("Must specify at least one peer!")
+    sys.exit(1)
+  for peer_host in args.peer_host:
+    port = args.listen_port
+    host, *maybe_port = peer_host.split(":", 1)
+    if maybe_port:
+      port = int(maybe_port[0])
+    peer_addresses.append((host, port))
+
+
+  uvloop.install()
+  main(
+      local_address=("0.0.0.0", args.listen_port),
+      peer_addresses=peer_addresses,
+      listen_interface=args.interface,
+      capture_filter=args.filter or 'udp port 3074',
+  )
 
