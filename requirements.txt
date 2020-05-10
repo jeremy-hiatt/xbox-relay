@@ -1,3 +1,2 @@
 scapy
 uvloop
-websockets

@@ -2,13 +2,13 @@ import asyncio
 import argparse
 import logging
 import queue
+import sys
 import threading
 
 from scapy.layers import inet, l2
 import scapy.packet
 import scapy.sendrecv
 import uvloop
-import websockets
 
 
 MAC_LENGTH = 17
@@ -20,99 +20,81 @@ XBOX_OUI_PREFIXES = {
   '30:59:b7',
   '60:45:bd',
 }
-
+L2_BROADCAST = "ff:ff:ff:ff:ff:ff"
 
 log = logging.getLogger(__name__)
 
 
-class WebSocketTunnel:
+class DatagramTunnel:
 
-  def __init__(self, peer_address, outbox_queue, inbox_queue):
-    self._peer_address = peer_address
-    self._outbox_queue = outbox_queue
+  def __init__(self, loop, local_address, peer_addresses, inbox_queue, outbox_queue):
+    self._loop = loop
+    self._local_address = local_address
     self._inbox_queue = inbox_queue
-    self._client_task = None
-    self._server = None
-    self._active_senders = 0
+    self._outbox_queue = outbox_queue
+    self._peer_addresses = peer_addresses
+    self._transport = None
+    self._outbox_task = None
+    self._remote_mac_to_forwarder_addr = {}
 
   async def start(self):
-    host, port = self._peer_address
-    if host == "0.0.0.0":
-      log.info("Starting in server mode listening on port %s!", port)
-      self._server = await websockets.serve(self._communicate, port=port)
-    else:
-      peer_uri = "ws://{}:{}".format(host, port)
-      self._client_task = asyncio.ensure_future(self._connect_to_server(peer_uri))
-
-  async def _connect_to_server(self, peer_uri):
-    backoff = 1
-    while True:
-      try:
-        log.info("Opening connection to %s", peer_uri)
-        websocket = None
-        async with websockets.connect(peer_uri) as websocket:
-          log.info("Connected to %s", peer_uri)
-          backoff = 1
-          await self._communicate(websocket)
-      except asyncio.CancelledError:
-        log.info("Shutting down!")
-        await websocket.close()
-        break
-      except Exception:
-        log.exception("Connection attempt failed!")
-        backoff = min(MAX_BACKOFF, backoff * 2)
-        log.info("Sleeping %s second(s) before retry.", backoff)
-        await asyncio.sleep(backoff)
-    log.info("Client task complete!")
+    self._transport, _ = await self._loop.create_datagram_endpoint(
+        lambda: self,
+        local_addr=self._local_address,
+        reuse_port=True,
+    )
+    self._outbox_task = asyncio.ensure_future(self._process_outbox())
 
   async def close(self):
-    if self._server:
-      self._server.close()
-      await self._server.wait_closed()
-      self._server = None
+    self._transport.close()
 
-    if self._client_task:
-      self._client_task.cancel()
-      await self._client_task
-      self._client_task = None
+  def connection_made(self, transport):
+    pass
 
-  def add_to_tunnel_queue(self, payload):
-    if not self._active_senders:
-      log.warning("No active connection; can't forward payload.")
+  def datagram_received(self, data, addr):
+    try:
+      packet = l2.Ether(data)
+    except Exception as e:
+      log.error("Failed to decode packet from %s: %r", addr, e)
       return
 
+    if packet.src not in self._remote_mac_to_forwarder_addr:
+      self._remote_mac_to_forwarder_addr[packet.src] = addr
+      log.info("MAC %s is forwarded by %s", packet.src, addr)
+
+    self._inbox_queue.put_nowait(packet)
+
+  async def _process_outbox(self):
+    while True:
+      payload, dest_addr = await self._outbox_queue.get()
+      log.debug("Got payload %s for dest addr %s", payload, dest_addr)
+      if dest_addr == L2_BROADCAST:
+        targets = self._peer_addresses
+      else:
+        forwarder_addr = self._remote_mac_to_forwarder_addr.get(dest_addr)
+        targets = [forwarder_addr] if forwarder_addr else []
+
+      if not targets:
+        log.warning("Not sure where to send packet destined for %s", dest_addr)
+        return
+
+      if len(payload) > 1400:
+        log.warning("Payload of length %d may exceed MTU!", len(payload))
+
+      for address in targets:
+        log.debug("Sending to %s", address)
+        try:
+          self._transport.sendto(payload, address)
+        except Exception as e:
+          log.error("Failed to deliver packet: %r", e)
+
+  def connection_lost(self, _):
+    if self._outbox_task:
+      self._outbox_task.cancel()
+      self._outbox_task = None
+
+  def add_to_tunnel_queue(self, payload):
     self._outbox_queue.put_nowait(payload)
-
-  async def _consume_inbound(self, websocket):
-    async for payload in websocket:
-      self._inbox_queue.put_nowait(payload)
-
-  async def _produce_outbound(self, websocket):
-    self._active_senders += 1
-    try:
-      while True:
-        payload = await self._outbox_queue.get()
-        await websocket.send(payload)
-    finally:
-      self._active_senders -= 1
-
-  async def _communicate(self, websocket, *args):
-    consumer = asyncio.ensure_future(self._consume_inbound(websocket))
-    producer = asyncio.ensure_future(self._produce_outbound(websocket))
-    try:
-      done, pending = await asyncio.wait(
-          [consumer, producer],
-          return_when=asyncio.FIRST_COMPLETED,
-      )
-    except asyncio.CancelledError:
-      for task in (consumer, producer):
-        task.cancel()
-
-      log.info("Cancelled!")
-      raise
-
-    for task in pending:
-      task.cancel()
 
 
 class L2Rebroadcaster(threading.Thread):
@@ -128,13 +110,12 @@ class L2Rebroadcaster(threading.Thread):
 
   def run(self):
     while True:
-      payload = self._outbox_queue.get()
-      if payload is None:
+      packet = self._outbox_queue.get()
+      if packet is None:
         log.info("Exiting rebroadcaster task.")
         break
 
       try:
-        packet = l2.Ether(payload)
         log.debug("Rebroadcasting packet %r", packet)
         self._addresses_spoofed.add(packet.src)
         scapy.sendrecv.sendp(packet, iface=self._iface, verbose=False)
@@ -159,21 +140,22 @@ class L2Forwarder:
 
     if self._local_mac_address and self._local_mac_address == packet.src:
       log.debug("Got packet needing forward: %r!", packet)
-      self._loop.call_soon_threadsafe(self._tunnel.add_to_tunnel_queue, bytes(packet))
+      self._loop.call_soon_threadsafe(self._tunnel.add_to_tunnel_queue,
+                                      (bytes(packet), packet.dst))
     else:
       log.debug("Ignoring packet from %s", packet.src)
 
 
-def main(peer_address, listen_interface, capture_filter):
+def main(local_address, peer_addresses, listen_interface, capture_filter):
   loop = asyncio.get_event_loop()
-  send_to_remote_peer_async_queue = asyncio.Queue()
+  send_to_remote_peers_async_queue = asyncio.Queue()
   send_to_local_xbox_queue = queue.Queue()
 
-  local_mac_address = None
-
-  tunnel = WebSocketTunnel(
-      peer_address=peer_address,
-      outbox_queue=send_to_remote_peer_async_queue,
+  tunnel = DatagramTunnel(
+      loop=loop,
+      local_address=local_address,
+      peer_addresses=peer_addresses,
+      outbox_queue=send_to_remote_peers_async_queue,
       inbox_queue=send_to_local_xbox_queue,
   )
 
@@ -211,13 +193,13 @@ parser.add_argument('-i', '--interface',
                     help="BSD interface name on which to handle XBox packets")
 
 parser.add_argument('-p', '--peer-host',
-                    default="0.0.0.0",
-                    help="Peer host to which to connect. Use 0.0.0.0 for server mode")
+                    action='append',
+                    help="Peer host to which to forward packets.")
 
 parser.add_argument('-l', '--listen-port',
                     type=int,
                     default=6715,
-                    help="Port for WebSocket server")
+                    help="Port for listen server")
 parser.add_argument("-v", "--verbose",
                     action='count',
                     help="Verbosity level (can be specified multiple times")
@@ -236,9 +218,22 @@ for verbosity in range(args.verbose or 0):
 logging.basicConfig(level=log_level)
 
 
+peer_addresses = []
+if not args.peer_host:
+  log.error("Must specify at least one peer!")
+  sys.exit(1)
+for peer_host in args.peer_host:
+  port = args.listen_port
+  host, *maybe_port = peer_host.split(":", 1)
+  if maybe_port:
+    port = int(maybe_port[0])
+  peer_addresses.append((host, port))
+
+
 uvloop.install()
 main(
-    peer_address=(args.peer_host, args.listen_port),
+    local_address=("0.0.0.0", args.listen_port),
+    peer_addresses=peer_addresses,
     listen_interface=args.interface,
     capture_filter=args.filter or 'udp port 3074',
 )
